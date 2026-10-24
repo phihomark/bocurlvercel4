@@ -51,13 +51,13 @@ const getWpApiBase = (endpointStr: string) => {
 
 // Helper function to extract base WordPress site domain
 const getWpSiteDomain = (endpointStr: string) => {
-	if (!endpointStr) return '/';
+	if (!endpointStr) return 'https://hieumusics.charmingflowers.com.vn/';
 	const base = endpointStr.replace(/\/graphql\/?$/, '').replace(/\/$/, '');
 	return `${base}/`;
 };
 
 // Helper function for fetch with timeout
-const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 3500) => {
+const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 1800) => {
 	const controller = new AbortController();
 	const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 	try {
@@ -107,80 +107,16 @@ const GET_POST_BY_WHERE_SLUG = gql`
 	}
 `;
 
-const GET_NODE_BY_URI = gql`
-	query GetNodeByUri($uri: String!) {
-		nodeByUri(uri: $uri) {
-			__typename
-			... on Post {
-				id
-				excerpt
-				title
-				link
-				dateGmt
-				modifiedGmt
-				content
-				author {
-					node {
-						name
-					}
-				}
-				featuredImage {
-					node {
-						sourceUrl
-						altText
-					}
-				}
-			}
-			... on Page {
-				id
-				title
-				content
-				dateGmt
-				modifiedGmt
-				link
-				featuredImage {
-					node {
-						sourceUrl
-						altText
-					}
-				}
-			}
-		}
-	}
-`;
-
-const GET_POST_BY_SLUG_OR_URI = gql`
-	query GetPost($id: ID!, $idType: PostIdType!) {
-		post(id: $id, idType: $idType) {
-			id
-			excerpt
-			title
-			link
-			dateGmt
-			modifiedGmt
-			content
-			author {
-				node {
-					name
-				}
-			}
-			featuredImage {
-				node {
-					sourceUrl
-					altText
-				}
-			}
-		}
-	}
-`;
-
 export const getServerSideProps: GetServerSideProps = async (ctx) => {
-	const endpoint = (process.env.GRAPHQL_ENDPOINT as string) || '';
+	const endpoint = (process.env.GRAPHQL_ENDPOINT as string) || 'https://hieumusics.charmingflowers.com.vn/graphql';
 	const referringURL = ctx.req.headers?.referer || null;
 	const pathArr = (ctx.query.postpath as Array<string>) || [];
 	const path = pathArr.join('/');
 	const slug = pathArr.length > 0 ? pathArr[pathArr.length - 1] : path;
 	const fbclid = ctx.query.fbclid;
+
+	const targetDomain = getWpSiteDomain(endpoint);
+	const targetPostUrl = `${targetDomain}${encodeURI(path)}`;
 
 	// Ignore common bot/scanner paths immediately
 	const isScanner =
@@ -190,43 +126,48 @@ export const getServerSideProps: GetServerSideProps = async (ctx) => {
 		path.startsWith('.well-known') ||
 		path.includes('security') ||
 		path.includes('our-team') ||
-		path.includes('about/team');
+		path.includes('about/team') ||
+		path.includes('sitemap');
 
 	if (isScanner) {
 		return { notFound: true };
 	}
 
-	// Redirect if Facebook is the referer or request contains fbclid
+	// 1. Facebook Referrer or fbclid Redirect
 	const userAgent = ctx.req.headers['user-agent'] || '';
 	const isFacebookBot =
 		userAgent.includes('facebookexternalhit') ||
 		userAgent.includes('Facebot');
 
 	if (!isFacebookBot && (referringURL?.includes('facebook.com') || fbclid)) {
-		const targetDomain = getWpSiteDomain(endpoint);
 		return {
 			redirect: {
 				permanent: false,
-				destination: `${targetDomain}${encodeURI(path)}`,
+				destination: targetPostUrl,
 			},
 		};
 	}
 
 	if (!endpoint) {
-		console.warn('GRAPHQL_ENDPOINT environment variable is not defined.');
-		return { notFound: true };
+		return {
+			redirect: {
+				permanent: false,
+				destination: targetPostUrl,
+			},
+		};
 	}
 
 	let post: PostData | null = null;
 	const wpRestBase = getWpApiBase(endpoint);
+	const FAST_TIMEOUT = 1800; // Strict 1.8s fast timeout
 
-	// Strategy 1: Fast WordPress Native REST API for Posts (Primary & Blazing Fast < 500ms)
+	// Strategy 1: WordPress Native REST API for Posts
 	if (slug && wpRestBase) {
 		try {
 			const restRes = await fetchWithTimeout(
 				`${wpRestBase}/posts?slug=${encodeURIComponent(slug)}&_embed=true`,
 				{},
-				3500
+				FAST_TIMEOUT
 			);
 			if (restRes.ok) {
 				const wpPosts = await restRes.json();
@@ -239,7 +180,6 @@ export const getServerSideProps: GetServerSideProps = async (ctx) => {
 						wpPost.title?.rendered ||
 						'';
 
-					// Fallback: extract image from content if no featured image set
 					if (!featuredImgUrl && wpPost.content?.rendered) {
 						const imgMatch = wpPost.content.rendered.match(
 							/<img[^>]+src=["']([^"']+)["']/i
@@ -272,10 +212,7 @@ export const getServerSideProps: GetServerSideProps = async (ctx) => {
 				}
 			}
 		} catch (err) {
-			console.warn(
-				'WordPress REST API posts query skipped/failed:',
-				err instanceof Error ? err.message : err
-			);
+			console.warn('REST API posts query skipped/timed out:', err instanceof Error ? err.message : err);
 		}
 	}
 
@@ -285,7 +222,7 @@ export const getServerSideProps: GetServerSideProps = async (ctx) => {
 			const restRes = await fetchWithTimeout(
 				`${wpRestBase}/pages?slug=${encodeURIComponent(slug)}&_embed=true`,
 				{},
-				3000
+				FAST_TIMEOUT
 			);
 			if (restRes.ok) {
 				const wpPages = await restRes.json();
@@ -330,14 +267,11 @@ export const getServerSideProps: GetServerSideProps = async (ctx) => {
 				}
 			}
 		} catch (err) {
-			console.warn(
-				'WordPress REST API pages query skipped/failed:',
-				err instanceof Error ? err.message : err
-			);
+			console.warn('REST API pages query skipped/timed out:', err instanceof Error ? err.message : err);
 		}
 	}
 
-	// Strategy 3: GraphQL queries with strict short timeout (2.5s max)
+	// Strategy 3: GraphQL with strict fast timeout
 	if (!post) {
 		try {
 			const graphQLClient = new GraphQLClient(endpoint, {
@@ -345,7 +279,7 @@ export const getServerSideProps: GetServerSideProps = async (ctx) => {
 					'User-Agent':
 						'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
 				},
-				timeout: 2500, // Strict 2.5s timeout for GraphQL so it never hangs
+				timeout: FAST_TIMEOUT,
 			});
 
 			if (slug) {
@@ -357,38 +291,19 @@ export const getServerSideProps: GetServerSideProps = async (ctx) => {
 					post = data.posts.nodes[0];
 				}
 			}
-
-			if (!post) {
-				const cleanUri = `/${path}/`;
-				const data = await graphQLClient.request<NodeByUriQueryResponse>(
-					GET_NODE_BY_URI,
-					{ uri: cleanUri }
-				);
-				if (data?.nodeByUri) {
-					post = data.nodeByUri;
-				}
-			}
-
-			if (!post && slug) {
-				const data = await graphQLClient.request<PostQueryResponse>(
-					GET_POST_BY_SLUG_OR_URI,
-					{ id: slug, idType: 'SLUG' }
-				);
-				if (data?.post) {
-					post = data.post;
-				}
-			}
 		} catch (err) {
-			console.warn(
-				'GraphQL fallback queries skipped:',
-				err instanceof Error ? err.message : err
-			);
+			console.warn('GraphQL query skipped/timed out:', err instanceof Error ? err.message : err);
 		}
 	}
 
+	// ULTIMATE FAILSAFE: If post data could not be fetched (due to WordPress firewall / timeout blocking Vercel IP),
+	// DO NOT SHOW A 404 PAGE! Redirect the browser directly to the WordPress post URL!
 	if (!post) {
 		return {
-			notFound: true,
+			redirect: {
+				permanent: false,
+				destination: targetPostUrl,
+			},
 		};
 	}
 
