@@ -57,7 +57,7 @@ const getWpSiteDomain = (endpointStr: string) => {
 };
 
 // Helper function for fetch with timeout
-const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 1800) => {
+const fetchWithTimeout = async (url: string, options: RequestInit = {}, timeoutMs = 2500) => {
 	const controller = new AbortController();
 	const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 	try {
@@ -101,6 +101,73 @@ const GET_POST_BY_WHERE_SLUG = gql`
 						sourceUrl
 						altText
 					}
+				}
+			}
+		}
+	}
+`;
+
+const GET_NODE_BY_URI = gql`
+	query GetNodeByUri($uri: String!) {
+		nodeByUri(uri: $uri) {
+			__typename
+			... on Post {
+				id
+				excerpt
+				title
+				link
+				dateGmt
+				modifiedGmt
+				content
+				author {
+					node {
+						name
+					}
+				}
+				featuredImage {
+					node {
+						sourceUrl
+						altText
+					}
+				}
+			}
+			... on Page {
+				id
+				title
+				content
+				dateGmt
+				modifiedGmt
+				link
+				featuredImage {
+					node {
+						sourceUrl
+						altText
+					}
+				}
+			}
+		}
+	}
+`;
+
+const GET_POST_BY_SLUG_OR_URI = gql`
+	query GetPost($id: ID!, $idType: PostIdType!) {
+		post(id: $id, idType: $idType) {
+			id
+			excerpt
+			title
+			link
+			dateGmt
+			modifiedGmt
+			content
+			author {
+				node {
+					name
+				}
+			}
+			featuredImage {
+				node {
+					sourceUrl
+					altText
 				}
 			}
 		}
@@ -158,146 +225,180 @@ export const getServerSideProps: GetServerSideProps = async (ctx) => {
 	}
 
 	let post: PostData | null = null;
-	const wpRestBase = getWpApiBase(endpoint);
-	const FAST_TIMEOUT = 1800; // Strict 1.8s fast timeout
+	const FAST_TIMEOUT = 2500; // 2.5s timeout per request
 
-	// Strategy 1: WordPress Native REST API for Posts
-	if (slug && wpRestBase) {
-		try {
-			const restRes = await fetchWithTimeout(
-				`${wpRestBase}/posts?slug=${encodeURIComponent(slug)}&_embed=true`,
-				{},
-				FAST_TIMEOUT
+	// =========================================================================
+	// STRATEGY 1: PRIMARY - FETCH VIA GRAPHQL AS REQUESTED
+	// =========================================================================
+	try {
+		const graphQLClient = new GraphQLClient(endpoint, {
+			headers: {
+				'User-Agent':
+					'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+				'Accept': 'application/json',
+			},
+			timeout: FAST_TIMEOUT,
+		});
+
+		// 1A. Try GraphQL posts(where: { name: $slug })
+		if (slug) {
+			const data = await graphQLClient.request<PostsWhereResponse>(
+				GET_POST_BY_WHERE_SLUG,
+				{ slug }
 			);
-			if (restRes.ok) {
-				const wpPosts = await restRes.json();
-				if (Array.isArray(wpPosts) && wpPosts.length > 0) {
-					const wpPost = wpPosts[0];
-					let featuredImgUrl =
-						wpPost._embedded?.['wp:featuredmedia']?.[0]?.source_url || '';
-					let featuredImgAlt =
-						wpPost._embedded?.['wp:featuredmedia']?.[0]?.alt_text ||
-						wpPost.title?.rendered ||
-						'';
-
-					if (!featuredImgUrl && wpPost.content?.rendered) {
-						const imgMatch = wpPost.content.rendered.match(
-							/<img[^>]+src=["']([^"']+)["']/i
-						);
-						if (imgMatch && imgMatch[1]) {
-							featuredImgUrl = imgMatch[1];
-						}
-					}
-
-					post = {
-						id: String(wpPost.id),
-						title: wpPost.title?.rendered || '',
-						excerpt: wpPost.excerpt?.rendered || '',
-						content: wpPost.content?.rendered || '',
-						link: wpPost.link || '',
-						dateGmt: wpPost.date_gmt || wpPost.date || '',
-						modifiedGmt: wpPost.modified_gmt || wpPost.modified || '',
-						author: {
-							node: {
-								name: wpPost._embedded?.author?.[0]?.name || '',
-							},
-						},
-						featuredImage: {
-							node: {
-								sourceUrl: featuredImgUrl,
-								altText: featuredImgAlt,
-							},
-						},
-					};
-				}
+			if (data?.posts?.nodes && data.posts.nodes.length > 0) {
+				post = data.posts.nodes[0];
 			}
-		} catch (err) {
-			console.warn('REST API posts query skipped/timed out:', err instanceof Error ? err.message : err);
 		}
+
+		// 1B. Try GraphQL nodeByUri(uri: $cleanUri)
+		if (!post) {
+			const cleanUri = `/${path}/`;
+			const data = await graphQLClient.request<NodeByUriQueryResponse>(
+				GET_NODE_BY_URI,
+				{ uri: cleanUri }
+			);
+			if (data?.nodeByUri) {
+				post = data.nodeByUri;
+			}
+		}
+
+		// 1C. Try GraphQL post(id: $slug, idType: SLUG)
+		if (!post && slug) {
+			const data = await graphQLClient.request<PostQueryResponse>(
+				GET_POST_BY_SLUG_OR_URI,
+				{ id: slug, idType: 'SLUG' }
+			);
+			if (data?.post) {
+				post = data.post;
+			}
+		}
+	} catch (err) {
+		console.warn('GraphQL query attempted as Primary Strategy 1, encountered WAF/Network response:', err instanceof Error ? err.message : err);
 	}
 
-	// Strategy 2: WordPress Native REST API for Pages
-	if (!post && slug && wpRestBase) {
-		try {
-			const restRes = await fetchWithTimeout(
-				`${wpRestBase}/pages?slug=${encodeURIComponent(slug)}&_embed=true`,
-				{},
-				FAST_TIMEOUT
-			);
-			if (restRes.ok) {
-				const wpPages = await restRes.json();
-				if (Array.isArray(wpPages) && wpPages.length > 0) {
-					const wpPage = wpPages[0];
-					let featuredImgUrl =
-						wpPage._embedded?.['wp:featuredmedia']?.[0]?.source_url || '';
-					let featuredImgAlt =
-						wpPage._embedded?.['wp:featuredmedia']?.[0]?.alt_text ||
-						wpPage.title?.rendered ||
-						'';
-
-					if (!featuredImgUrl && wpPage.content?.rendered) {
-						const imgMatch = wpPage.content.rendered.match(
-							/<img[^>]+src=["']([^"']+)["']/i
-						);
-						if (imgMatch && imgMatch[1]) {
-							featuredImgUrl = imgMatch[1];
-						}
-					}
-
-					post = {
-						id: String(wpPage.id),
-						title: wpPage.title?.rendered || '',
-						excerpt: wpPage.excerpt?.rendered || '',
-						content: wpPage.content?.rendered || '',
-						link: wpPage.link || '',
-						dateGmt: wpPage.date_gmt || wpPage.date || '',
-						modifiedGmt: wpPage.modified_gmt || wpPage.modified || '',
-						author: {
-							node: {
-								name: wpPage._embedded?.author?.[0]?.name || '',
-							},
-						},
-						featuredImage: {
-							node: {
-								sourceUrl: featuredImgUrl,
-								altText: featuredImgAlt,
-							},
-						},
-					};
-				}
-			}
-		} catch (err) {
-			console.warn('REST API pages query skipped/timed out:', err instanceof Error ? err.message : err);
-		}
-	}
-
-	// Strategy 3: GraphQL with strict fast timeout
+	// =========================================================================
+	// STRATEGY 2: REST API FALLBACK (In case GraphQL is blocked by Nginx WAF)
+	// =========================================================================
 	if (!post) {
-		try {
-			const graphQLClient = new GraphQLClient(endpoint, {
-				headers: {
-					'User-Agent':
-						'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-				},
-				timeout: FAST_TIMEOUT,
-			});
-
-			if (slug) {
-				const data = await graphQLClient.request<PostsWhereResponse>(
-					GET_POST_BY_WHERE_SLUG,
-					{ slug }
+		const wpRestBase = getWpApiBase(endpoint);
+		if (slug && wpRestBase) {
+			try {
+				const restRes = await fetchWithTimeout(
+					`${wpRestBase}/posts?slug=${encodeURIComponent(slug)}&_embed=true`,
+					{},
+					FAST_TIMEOUT
 				);
-				if (data?.posts?.nodes && data.posts.nodes.length > 0) {
-					post = data.posts.nodes[0];
+				if (restRes.ok) {
+					const wpPosts = await restRes.json();
+					if (Array.isArray(wpPosts) && wpPosts.length > 0) {
+						const wpPost = wpPosts[0];
+						let featuredImgUrl =
+							wpPost._embedded?.['wp:featuredmedia']?.[0]?.source_url || '';
+						let featuredImgAlt =
+							wpPost._embedded?.['wp:featuredmedia']?.[0]?.alt_text ||
+							wpPost.title?.rendered ||
+							'';
+
+						if (!featuredImgUrl && wpPost.content?.rendered) {
+							const imgMatch = wpPost.content.rendered.match(
+								/<img[^>]+src=["']([^"']+)["']/i
+							);
+							if (imgMatch && imgMatch[1]) {
+								featuredImgUrl = imgMatch[1];
+							}
+						}
+
+						post = {
+							id: String(wpPost.id),
+							title: wpPost.title?.rendered || '',
+							excerpt: wpPost.excerpt?.rendered || '',
+							content: wpPost.content?.rendered || '',
+							link: wpPost.link || '',
+							dateGmt: wpPost.date_gmt || wpPost.date || '',
+							modifiedGmt: wpPost.modified_gmt || wpPost.modified || '',
+							author: {
+								node: {
+									name: wpPost._embedded?.author?.[0]?.name || '',
+								},
+							},
+							featuredImage: {
+								node: {
+									sourceUrl: featuredImgUrl,
+									altText: featuredImgAlt,
+								},
+							},
+						};
+					}
 				}
+			} catch (err) {
+				console.warn('REST API fallback posts query skipped:', err instanceof Error ? err.message : err);
 			}
-		} catch (err) {
-			console.warn('GraphQL query skipped/timed out:', err instanceof Error ? err.message : err);
 		}
 	}
 
-	// ULTIMATE FAILSAFE: If post data could not be fetched (due to WordPress firewall / timeout blocking Vercel IP),
-	// DO NOT SHOW A 404 PAGE! Redirect the browser directly to the WordPress post URL!
+	// Strategy 2B: REST API for Pages fallback
+	if (!post) {
+		const wpRestBase = getWpApiBase(endpoint);
+		if (slug && wpRestBase) {
+			try {
+				const restRes = await fetchWithTimeout(
+					`${wpRestBase}/pages?slug=${encodeURIComponent(slug)}&_embed=true`,
+					{},
+					FAST_TIMEOUT
+				);
+				if (restRes.ok) {
+					const wpPages = await restRes.json();
+					if (Array.isArray(wpPages) && wpPages.length > 0) {
+						const wpPage = wpPages[0];
+						let featuredImgUrl =
+							wpPage._embedded?.['wp:featuredmedia']?.[0]?.source_url || '';
+						let featuredImgAlt =
+							wpPage._embedded?.['wp:featuredmedia']?.[0]?.alt_text ||
+							wpPage.title?.rendered ||
+							'';
+
+						if (!featuredImgUrl && wpPage.content?.rendered) {
+							const imgMatch = wpPage.content.rendered.match(
+								/<img[^>]+src=["']([^"']+)["']/i
+							);
+							if (imgMatch && imgMatch[1]) {
+								featuredImgUrl = imgMatch[1];
+							}
+						}
+
+						post = {
+							id: String(wpPage.id),
+							title: wpPage.title?.rendered || '',
+							excerpt: wpPage.excerpt?.rendered || '',
+							content: wpPage.content?.rendered || '',
+							link: wpPage.link || '',
+							dateGmt: wpPage.date_gmt || wpPage.date || '',
+							modifiedGmt: wpPage.modified_gmt || wpPage.modified || '',
+							author: {
+								node: {
+									name: wpPage._embedded?.author?.[0]?.name || '',
+								},
+							},
+							featuredImage: {
+								node: {
+									sourceUrl: featuredImgUrl,
+									altText: featuredImgAlt,
+								},
+							},
+						};
+					}
+				}
+			} catch (err) {
+				console.warn('REST API fallback pages query skipped:', err instanceof Error ? err.message : err);
+			}
+		}
+	}
+
+	// =========================================================================
+	// STRATEGY 3: REDIRECT FAILSAFE
+	// (If both GraphQL and REST API fail/time out due to WAF firewall, redirect to WP URL)
+	// =========================================================================
 	if (!post) {
 		return {
 			redirect: {
